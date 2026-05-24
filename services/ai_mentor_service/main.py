@@ -1,7 +1,7 @@
 """
 NeuroForge — AI Mentor Service
-Powers the AI learning assistant with LLM integration, Knowledge Graph context,
-and conversation management.
+Powers the AI learning assistant with Gemma 4 E4B (via Ollama),
+Knowledge Graph context, and conversation management.
 """
 
 from __future__ import annotations
@@ -13,17 +13,15 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 # ── Config ───────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:e4b")
 KG_URL = os.getenv("KNOWLEDGE_GRAPH_SERVICE_URL", "http://localhost:8002")
 PROFILING_URL = os.getenv("COGNITIVE_PROFILING_SERVICE_URL", "http://localhost:8004")
 
-app = FastAPI(title="NeuroForge AI Mentor Service", version="0.1.0")
-llm_client: Optional[AsyncOpenAI] = None
+app = FastAPI(title="NeuroForge AI Mentor Service", version="0.2.0")
 http: Optional[httpx.AsyncClient] = None
 
 # In-memory conversation store (PoC — replace with DB in production)
@@ -76,9 +74,8 @@ class MentorResponse(BaseModel):
 # ── Lifecycle ────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    global llm_client, http
-    llm_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    http = httpx.AsyncClient(timeout=30.0)
+    global http
+    http = httpx.AsyncClient(timeout=120.0)
 
 
 @app.on_event("shutdown")
@@ -87,7 +84,37 @@ async def shutdown():
         await http.aclose()
 
 
-# ── Helpers ──────────────────────────────────────────────────
+# ── Ollama LLM helper ───────────────────────────────────────
+async def _chat_completion(messages: list[dict], temperature: float = 1.0) -> str:
+    """
+    Call Ollama's /api/chat endpoint with the Gemma 4 E4B model.
+    Uses Gemma 4 recommended sampling: temperature=1.0, top_p=0.95, top_k=64.
+    """
+    payload = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "top_p": 0.95,
+            "top_k": 64,
+            "num_predict": 1024,
+        },
+    }
+    try:
+        resp = await http.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["message"]["content"]
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(502, f"Ollama returned {e.response.status_code}: {e.response.text}")
+    except httpx.ConnectError:
+        raise HTTPException(503, "Cannot reach Ollama — is the ollama service running?")
+    except Exception as e:
+        raise HTTPException(502, f"LLM call failed: {str(e)}")
+
+
+# ── KG & Profiling helpers ───────────────────────────────────
 async def _fetch_concept_by_name(name: str) -> Optional[dict]:
     """Search KG for a concept by name."""
     try:
@@ -154,7 +181,7 @@ async def _log_interaction(user_id: str, event_type: str, details: dict):
 def _build_kg_context(concept: dict, modules: list, related: list, prerequisites: list) -> str:
     """Build a knowledge graph context string for the LLM prompt."""
     parts = []
-    parts.append(f"=== Knowledge Graph Context ===")
+    parts.append("=== Knowledge Graph Context ===")
     parts.append(f"Concept: {concept['name']}")
     parts.append(f"Description: {concept.get('description', 'N/A')}")
     parts.append(f"Difficulty: {concept.get('difficultyLevel', 'N/A')}")
@@ -171,7 +198,10 @@ def _build_kg_context(concept: dict, modules: list, related: list, prerequisites
     if modules:
         parts.append("Available Learning Modules:")
         for m in modules:
-            parts.append(f"  - [{m['type']}] {m['title']} ({m.get('estimatedDurationMinutes', '?')} min, {m.get('difficultyLevel', '?')})")
+            parts.append(
+                f"  - [{m['type']}] {m['title']} "
+                f"({m.get('estimatedDurationMinutes', '?')} min, {m.get('difficultyLevel', '?')})"
+            )
 
     return "\n".join(parts)
 
@@ -179,9 +209,6 @@ def _build_kg_context(concept: dict, modules: list, related: list, prerequisites
 # ── Endpoints ────────────────────────────────────────────────
 @app.post("/mentor/query", response_model=MentorResponse)
 async def submit_query(req: QueryRequest):
-    if not llm_client:
-        raise HTTPException(503, "LLM not configured — set OPENAI_API_KEY")
-
     conv_id = req.conversationId or f"conv_{uuid.uuid4().hex[:12]}"
     if conv_id not in conversations:
         conversations[conv_id] = []
@@ -203,9 +230,7 @@ async def submit_query(req: QueryRequest):
 
     # Try to find concept from query text via search
     if not concept:
-        # Extract potential concept names — simple heuristic for PoC
         query_lower = req.text.lower()
-        # Search KG for any matching concept
         try:
             resp = await http.get(f"{KG_URL}/concepts", params={"limit": 50})
             if resp.status_code == 200:
@@ -228,7 +253,6 @@ async def submit_query(req: QueryRequest):
         prerequisites = await _fetch_prerequisites(cid)
         kg_context = _build_kg_context(concept, modules, related, prerequisites)
 
-        # Build suggested actions
         for m in modules[:3]:
             suggested_actions.append({
                 "type": "VIEW_MODULE",
@@ -255,17 +279,8 @@ async def submit_query(req: QueryRequest):
     messages.extend(history)
     messages.append({"role": "user", "content": req.text})
 
-    # ── Call LLM ──
-    try:
-        completion = await llm_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=1024,
-        )
-        response_text = completion.choices[0].message.content
-    except Exception as e:
-        raise HTTPException(502, f"LLM call failed: {str(e)}")
+    # ── Call Gemma 4 E4B via Ollama ──
+    response_text = await _chat_completion(messages)
 
     # Store in conversation history
     conversations[conv_id].append({"role": "user", "content": req.text})
@@ -291,7 +306,7 @@ async def submit_query(req: QueryRequest):
 
 @app.get("/mentor/history/{user_id}")
 async def get_history(user_id: str, conversationId: Optional[str] = None, limit: int = 20):
-    """Retrieve conversation history (PoC: all conversations are accessible)."""
+    """Retrieve conversation history."""
     if conversationId:
         history = conversations.get(conversationId, [])
         return {
@@ -301,7 +316,6 @@ async def get_history(user_id: str, conversationId: Optional[str] = None, limit:
                 "messages": history[-limit:],
             }],
         }
-    # Return all conversations (PoC simplification)
     all_convos = []
     for cid, messages in conversations.items():
         all_convos.append({
@@ -313,8 +327,23 @@ async def get_history(user_id: str, conversationId: Optional[str] = None, limit:
 
 @app.get("/health")
 async def health():
+    # Check if Ollama is reachable and model is available
+    ollama_ok = False
+    model_loaded = False
+    try:
+        resp = await http.get(f"{OLLAMA_URL}/api/tags", timeout=5.0)
+        if resp.status_code == 200:
+            ollama_ok = True
+            models = resp.json().get("models", [])
+            model_loaded = any(m.get("name", "").startswith(LLM_MODEL.split(":")[0]) for m in models)
+    except Exception:
+        pass
+
     return {
-        "status": "healthy",
+        "status": "healthy" if ollama_ok else "degraded",
         "service": "ai_mentor_service",
-        "llm_configured": bool(OPENAI_API_KEY),
+        "llm_backend": "ollama",
+        "llm_model": LLM_MODEL,
+        "ollama_reachable": ollama_ok,
+        "model_loaded": model_loaded,
     }

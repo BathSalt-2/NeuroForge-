@@ -2,6 +2,7 @@ version: "3.9"
 
 # ═══════════════════════════════════════════════════════════
 # NeuroForge — Docker Compose (PoC)
+# LLM: Gemma 4 E4B via Ollama (fully local, no API keys)
 # ═══════════════════════════════════════════════════════════
 
 services:
@@ -37,6 +38,42 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # ── Ollama (local LLM server) ──────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Uncomment below for GPU acceleration (requires nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  # Pulls Gemma 4 E4B into Ollama on first run, then exits
+  ollama-model-pull:
+    image: curlimages/curl:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c '
+        echo "Pulling ${LLM_MODEL:-gemma4:e4b} into Ollama...";
+        curl -sf http://ollama:11434/api/pull -d "{\"name\": \"${LLM_MODEL:-gemma4:e4b}\"}" &&
+        echo "Model ready!"
+      '
+    restart: "no"
 
   # ── Neo4j Seed Runner ──────────────────────────────────
   neo4j-seed:
@@ -84,10 +121,15 @@ services:
     ports:
       - "8003:8003"
     depends_on:
-      - knowledge-graph-service
+      ollama:
+        condition: service_healthy
+      ollama-model-pull:
+        condition: service_completed_successfully
+      knowledge-graph-service:
+        condition: service_started
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      OLLAMA_URL: http://ollama:11434
+      LLM_MODEL: ${LLM_MODEL:-gemma4:e4b}
       KNOWLEDGE_GRAPH_SERVICE_URL: http://knowledge-graph-service:8002
       COGNITIVE_PROFILING_SERVICE_URL: http://cognitive-profiling-service:8004
 
@@ -149,3 +191,4 @@ services:
 volumes:
   neo4j_data:
   pg_data:
+  ollama_data:

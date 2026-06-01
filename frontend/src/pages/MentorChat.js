@@ -48,7 +48,7 @@ export default function MentorChat() {
     } catch (e) {
       setMessages(prev => [
         ...prev,
-        { role: 'assistant', text: `⚠️ Error: ${e.message}. Make sure the AI Mentor service is running and OPENAI_API_KEY is set.` },
+        { role: 'assistant', text: `⚠️ Error: ${e.message}. Make sure the AI Mentor and Ollama services are running (Gemma 4 E4B model).` },
       ]);
     } finally {
       setLoading(false);
